@@ -1,0 +1,12 @@
+torch
+torchvision
+open-clip-torch
+gradio
+numpy
+Pillow
+datasets
+huggingface_hub
+aiogram
+requests
+tqdm
+opencv-python-headless

@@ -12,9 +12,9 @@ Imported by both the Gradio app and Telegram bot.
 import csv
 import os
 
-import cv2
 import numpy as np
 import torch
+import mediapipe as mp
 from PIL import Image
 
 # ---------------------------------------------------------------------------
@@ -27,7 +27,6 @@ _CSV_PATH = os.path.join(_DATA_DIR, "portraits_metadata.csv")
 _CLIP_EMB_PATH = os.path.join(_DATA_DIR, "clip_embeddings.npy")
 _FARL_EMB_PATH = os.path.join(_DATA_DIR, "farl_embeddings.npy")
 _FARL_WEIGHTS_PATH = os.path.join(_DIR, "models", "FaRL-Base-Patch16-LAIONFace20M-ep16.pth")
-_CASCADE_PATH = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
 
 # ---------------------------------------------------------------------------
 # Device
@@ -74,40 +73,50 @@ with open(_CSV_PATH, newline="", encoding="utf-8") as _f:
 
 assert len(metadata) == clip_embeddings.shape[0] == farl_embeddings.shape[0]
 
-print(f"Matcher loaded: {len(metadata)} paintings, device={DEVICE}")
+# Per-painting face flags (from detect_faces_paintings.py)
+_has_face = np.array(
+    [row.get("has_face", "True") == "True" for row in metadata], dtype=bool
+)
+
+print(f"Matcher loaded: {len(metadata)} paintings, device={DEVICE}, "
+      f"faces={_has_face.sum()}/{len(metadata)}")
 
 # ---------------------------------------------------------------------------
-# Haar cascade for face detection
+# MediaPipe face detection (tasks API)
 # ---------------------------------------------------------------------------
-_face_cascade = cv2.CascadeClassifier(_CASCADE_PATH)
+_MP_MODEL_PATH = os.path.join(_DIR, "models", "blaze_face_short_range.tflite")
+_mp_face_detector = mp.tasks.vision.FaceDetector.create_from_options(
+    mp.tasks.vision.FaceDetectorOptions(
+        base_options=mp.tasks.BaseOptions(model_asset_path=_MP_MODEL_PATH),
+        min_detection_confidence=0.5,
+    )
+)
 
 
 # ---------------------------------------------------------------------------
 # Face cropping
 # ---------------------------------------------------------------------------
 def crop_face(image: Image.Image) -> tuple[Image.Image, Image.Image]:
-    """Detect the largest face and return (tight_crop, loose_crop).
+    """Detect the highest-confidence face and return (tight_crop, loose_crop).
 
     tight_crop: ~15% padding around the face box  (for FaRL)
     loose_crop: ~40% padding including surroundings (for CLIP vibe)
 
-    If no face is found, both crops are the original image.
+    If no face is found, both crops are the original image (same object).
     """
-    img_array = np.array(image)
-    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    img_array = np.array(image.convert("RGB"))
+    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_array)
+    results = _mp_face_detector.detect(mp_img)
 
-    faces = _face_cascade.detectMultiScale(
-        gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
-    )
-
-    if len(faces) == 0:
+    if not results.detections:
         return image, image
 
-    # Pick the largest face by area
-    areas = [w * h for (_, _, w, h) in faces]
-    x, y, w, h = faces[np.argmax(areas)]
+    # Pick detection with highest confidence
+    best = max(results.detections, key=lambda d: d.categories[0].score)
+    bb = best.bounding_box
 
     img_h, img_w = img_array.shape[:2]
+    x, y, w, h = bb.origin_x, bb.origin_y, bb.width, bb.height
 
     def _padded_crop(pad_frac: float) -> Image.Image:
         pad_x = int(w * pad_frac)
@@ -153,6 +162,7 @@ def find_matches(
     image: Image.Image,
     alpha: float = 0.5,
     top_k: int = 5,
+    min_clip_sim: float = 0.15,
 ) -> list[dict]:
     """Find the top-K painting matches for a selfie.
 
@@ -160,10 +170,13 @@ def find_matches(
         image:  PIL RGB image (a selfie / photo of a face).
         alpha:  Blend weight.  0 = pure CLIP vibe, 1 = pure FaRL face.
         top_k:  Number of results to return.
+        min_clip_sim:  Minimum raw CLIP cosine similarity.  Results below
+                       this are filtered unless *all* results fall below it.
 
     Returns:
         List of dicts, each with all CSV metadata fields plus:
-            blended_score, clip_score, farl_score, painting_index, painting_path
+            blended_score, clip_score, farl_score, painting_index,
+            painting_path, low_confidence
     """
     image = image.convert("RGB")
 
@@ -184,6 +197,9 @@ def find_matches(
     clip_z = (clip_sims - clip_sims.mean()) / (clip_sims.std() + 1e-8)
     farl_z = (farl_sims - farl_sims.mean()) / (farl_sims.std() + 1e-8)
 
+    # E2 — zero out FaRL signal for faceless paintings
+    farl_z[~_has_face] = 0.0
+
     # F — blend
     final_scores = alpha * farl_z + (1 - alpha) * clip_z
 
@@ -201,7 +217,16 @@ def find_matches(
         row["painting_path"] = os.path.join(_PORTRAITS_DIR, metadata[idx]["filename"])
         results.append(row)
 
-    return results
+    # I — minimum CLIP similarity threshold
+    above = [r for r in results if r["clip_score"] >= min_clip_sim]
+    if above:
+        for r in above:
+            r["low_confidence"] = False
+        return above
+    else:
+        for r in results:
+            r["low_confidence"] = True
+        return results
 
 
 # ---------------------------------------------------------------------------
